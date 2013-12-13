@@ -1,0 +1,275 @@
+#!/usr/bin/python
+DOCUMENTATION = '''
+---
+module: ec2_nic
+short_description: Create new NIC Instances
+description:
+    - This module allows creation of NIC instances on EC2
+version_added: 1.4 (memiah)
+options:
+  
+requirements: [ "boto" ]
+author: Craig Miller <craig@memiah.co.uk>
+notes:
+  
+'''
+
+EXAMPLES = '''
+
+'''
+
+try:
+    import boto.ec2
+except ImportError:
+    boto_found = False
+else:
+    boto_found = True
+
+
+def connect(ec2_url, ec2_access_key, ec2_secret_key, region, module):
+
+    """ Return an ec2 connection"""
+    # allow environment variables to be used if ansible vars aren't set
+    if not ec2_url and 'EC2_URL' in os.environ:
+        ec2_url = os.environ['EC2_URL']
+    if not ec2_secret_key and 'EC2_SECRET_KEY' in os.environ:
+        ec2_secret_key = os.environ['EC2_SECRET_KEY']
+    if not ec2_access_key and 'EC2_ACCESS_KEY' in os.environ:
+        ec2_access_key = os.environ['EC2_ACCESS_KEY']
+
+    # If we have a region specified, connect to its endpoint.
+    if region:
+        try:
+            ec2 = boto.ec2.connect_to_region(region,
+                                        aws_access_key_id=ec2_access_key,
+                                        aws_secret_access_key=ec2_secret_key)
+        except boto.exception.NoAuthHandlerFound, e:
+            module.fail_json(msg = str(" %s %s %s " % (region, ec2_access_key,
+                                                       ec2_secret_key)))
+    # Otherwise, no region so we fallback to the old connection method
+    else:
+        try:
+            if ec2_url: # if we have an URL set, connect to the specified endpoint
+                ec2 = boto.connect_ec2_endpoint(ec2_url, ec2_access_key, ec2_secret_key)
+            else: # otherwise it's Amazon.
+                ec2 = boto.connect_ec2(ec2_access_key, ec2_secret_key)
+        except boto.exception.NoAuthHandlerFound, e:
+            module.fail_json(msg = str(e))
+    return ec2
+
+
+def find_nics(ec2, filters, module):
+    try:
+        nics = ec2.get_all_network_interfaces(filters)
+    except boto.exception.EC2ResponseError, e:
+        module.fail_json(msg=str(e.message))
+    
+    if len(nics):
+        return nics
+    
+    return False
+
+def create_nic(ec2, description, group_id, private_ip_address, subnet_id, module):
+    
+    groups = []
+    if group_id:
+        groups = [group_id]
+    
+    try:
+        nic = ec2.create_network_interface(subnet_id, private_ip_address, description, groups)
+    except boto.exception.EC2ResponseError, e:
+        module.fail_json(msg=str(e.message))
+        
+    return nic
+    
+def attach_nic_to_instance(ec2, nic, instance_id, device_index, module):
+    
+    if nic_is_attached_to_instance(ec2, nic, instance_id, module):
+        return False
+        
+    try:
+        att = ec2.attach_network_interface(nic.id, instance_id, device_index)
+    except boto.exception.EC2ResponseError, e:
+        module.fail_json(msg=str(e.message))
+        
+    return True
+        
+def nic_is_attached_to_instance(ec2, nic, instance_id, module):
+    
+    if nic.attachment == None:
+        return False
+    
+    if nic.attachment.instance_id != instance_id:
+        return False
+    
+    return True
+
+def update_nic_attributes(ec2, nic, description, group_id, secondary_ips, module):
+    try:
+        changed = False
+        if nic.description != description:
+            ec2.modify_network_interface_attribute(nic.id,'description', description)
+            changed = True
+        
+        #This should check all groups etc... but in time...
+        if nic.groups[0].id != group_id:
+            ec2.modify_network_interface_attribute(nic.id,'groupset', group_id)
+            changed = True
+               
+        if secondary_ips:
+            remove = []
+            add = []
+            assigned = []
+            
+            for ip in nic.private_ip_addresses:
+                if ip.primary != True:
+                    assigned.append(ip.private_ip_address)
+                        
+            add = [i for i in secondary_ips if i not in assigned]
+            remove = [i for i in assigned if i not in secondary_ips]
+            
+            if len(remove):
+                ec2.unassign_private_ip_addresses(nic.id, remove)
+                changed = True
+            
+            if len(add):
+                ec2.assign_private_ip_addresses(nic.id, add, allow_reassignment=True)
+                changed = True
+                            
+    
+    except boto.exception.EC2ResponseError, e:
+        module.fail_json(msg=str(e))
+        
+    return changed
+
+
+def find_instance(ec2, instance_id, module):
+    """ Attempt to find the EC2 instance and return it """
+    
+    try:
+        reservations = ec2.get_all_reservations(instance_ids=[instance_id])
+ 
+    except boto.exception.EC2ResponseError, e:
+        module.fail_json(msg=str(e))
+    
+    if len(reservations) == 1:
+        instances = reservations[0].instances
+        if len(instances) == 1:
+            return instances[0]
+    
+    module.fail_json(msg="could not find instance " + instance_id)
+    
+
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            description = dict(required=False),
+            private_ip = dict(required=False, aliases= ['ip']),
+            secondary_ips = dict(required=False),
+            state = dict(required=False, default='present',
+                         choices=['present', 'absent']),
+            ec2_url = dict(required=False, aliases=['EC2_URL']),
+            ec2_secret_key = dict(required=False, aliases=['EC2_SECRET_KEY'], no_log=True),
+            ec2_access_key = dict(required=False, aliases=['EC2_ACCESS_KEY']),
+            region = dict(required=False, aliases=['ec2_region']),
+            group_id = dict(required=False),
+            instance_id = dict(required=False),
+            vpc_subnet_id = dict(required=False),
+            device_index = dict(required=False)
+        ),
+        supports_check_mode=True
+    )
+
+    if not boto_found:
+        module.fail_json(msg="boto is required")
+
+    ec2_url, ec2_access_key, ec2_secret_key, region = get_ec2_creds(module)
+
+    ec2 = connect(ec2_url,
+                  ec2_access_key,
+                  ec2_secret_key,
+                  region,
+                  module)
+
+    description = module.params.get('description')
+    private_ip_address = module.params.get('private_ip')
+    state = module.params.get('state')
+    secondary_ips = module.params.get('secondary_ips')
+    instance_id = module.params.get('instance_id')
+    vpc_subnet_id = module.params.get('vpc_subnet_id')
+    group_id = module.params.get('group_id')
+    device_index = module.params.get('device_index')
+    
+    nic = False
+    
+    filters = {}
+    if device_index:
+        filters['attachment.device_index'] = device_index
+        filters['attachment.instance_id'] = instance_id
+    
+
+    if state == 'present' and len(filters):
+        #We've got a device we want to update
+        nics = find_nics(ec2, filters, module)
+
+        if nics:
+            nic = nics[0]
+            if nic.private_ip_address != private_ip_address:
+                module.fail_json(msg="NIC has been created with wrong Primary IP! This cannot be resolved here at this time. Make sure the NIC was created with the correct IP")
+
+        #We need a new one
+        if not nic:
+            nic = create_nic(ec2, description, group_id, private_ip_address, vpc_subnet_id, module)
+        
+        #We need it attached to an instance
+        if instance_id:
+            #We need to attach it
+            attached = attach_nic_to_instance(ec2, nic, instance_id, device_index, module)
+        
+        if nic:
+            changed = update_nic_attributes(ec2, nic, description, group_id, secondary_ips, module)    
+        
+        nic_dict_array = {'id': nic.id, 'device_index': device_index}
+        
+        module.exit_json(changed=changed or attached, nic=nic_dict_array)    
+        
+        
+    elif state == 'present' and len(filters) == 0:
+        #Since we have no filters, just create new one
+        nic = create_nic(ec2, description, group_id, private_ip_address, vpc_subnet_id, module)
+        if instance_id:
+            attach_nic_to_instance(ec2, nic, instance_id, device_index, module)
+            
+        module.exit_json(changed=True, nic_id=nic.id)
+        
+    elif state == 'absent':    
+        module.fail_json(msg="Absent is not Implemented!")
+#     if state == 'present':
+#         if public_ip is None:
+#             if instance_id is None:
+#                 address = allocate_address(ec2, domain, module)
+#                 module.exit_json(changed=True, public_ip=address.public_ip)
+#             else:
+#                 # Determine if the instance is inside a VPC or not
+#                 instance = find_instance(ec2, instance_id, module)
+#                 if instance.vpc_id != None:
+#                     domain = "vpc"
+#                 address = allocate_address(ec2, domain, module)
+#         else:
+#             address = find_address(ec2, public_ip, module)
+#         associate_ip_and_instance(ec2, address, instance_id, module)
+#     else:
+#         if instance_id is None:
+#             release_address(ec2, public_ip, module)
+#         else:
+#             address = find_address(ec2, public_ip, module)
+#             disassociate_ip_and_instance(ec2, address, instance_id, module)
+
+
+
+# import module snippets
+from ansible.module_utils.basic import *
+from ansible.module_utils.ec2 import *
+
+if __name__ == '__main__':
+    main()

@@ -155,7 +155,24 @@ def associate_ip_and_instance(ec2, address, instance_id, module):
     else:
         module.fail_json(msg="association failed")
 
+def associate_ip_and_interface(ec2, address, interface_id, private_ip_address, module):
+    if ip_is_associated_with_interface(ec2, address.public_ip, interface_id, module):
+        module.exit_json(changed=False, public_ip=address.public_ip)
 
+    # If we're in check mode, nothing else to do
+    if module.check_mode:
+        module.exit_json(changed=True)
+
+    try:
+        res = ec2.associate_address(allocation_id=address.allocation_id, network_interface_id=interface_id, private_ip_address=private_ip_address)
+    except boto.exception.EC2ResponseError, e:
+        module.fail_json(msg=str(e))
+    
+    if res:
+        module.exit_json(changed=True, public_ip=address.public_ip, private_ip_address=private_ip_address)
+    else:
+        module.fail_json(msg="association failed")
+        
 def disassociate_ip_and_instance(ec2, address, instance_id, module):
     if not ip_is_associated_with_instance(ec2, address.public_ip, instance_id, module):
         module.exit_json(changed=False, public_ip=address.public_ip)
@@ -177,6 +194,24 @@ def disassociate_ip_and_instance(ec2, address, instance_id, module):
     else:
         module.fail_json(msg="disassociation failed")
 
+def disassociate_ip_and_interface(ec2, address, interface_id, module):
+    if not ip_is_associated_with_interface(ec2, address.public_ip, interface_id, module):
+        module.exit_json(changed=False, public_ip=address.public_ip)
+
+    # If we're in check mode, nothing else to do
+    if module.check_mode:
+        module.exit_json(changed=True)
+
+    try:
+        res = ec2.disassociate_address(association_id=address.association_id)
+        
+    except boto.exception.EC2ResponseError, e:
+        module.fail_json(msg=str(e))
+
+    if res:
+        module.exit_json(changed=True)
+    else:
+        module.fail_json(msg="disassociation failed")
 
 def find_address(ec2, public_ip, module):
     """ Find an existing Elastic IP address """
@@ -192,11 +227,20 @@ def find_address(ec2, public_ip, module):
 def ip_is_associated_with_instance(ec2, public_ip, instance_id, module):
     """ Check if the elastic IP is currently associated with the instance """
     address = find_address(ec2, public_ip, module)
+
     if address:
         return address.instance_id == instance_id
     else:
         return False
 
+def ip_is_associated_with_interface(ec2, public_ip, interface_id, module):
+    """ Check if the elastic IP is currently associated with the instance """
+    address = find_address(ec2, public_ip, module)
+
+    if address:
+        return address.network_interface_id == interface_id
+    else:
+        return False
 
 def allocate_address(ec2, domain, module):
     """ Allocate a new elastic IP address and return it """
@@ -229,6 +273,7 @@ def find_instance(ec2, instance_id, module):
     
     try:
         reservations = ec2.get_all_reservations(instance_ids=[instance_id])
+ 
     except boto.exception.EC2ResponseError, e:
         module.fail_json(msg=str(e))
     
@@ -237,7 +282,7 @@ def find_instance(ec2, instance_id, module):
         if len(instances) == 1:
             return instances[0]
     
-    module.fail_json(msg="could not find instance" + instance_id)
+    module.fail_json(msg="could not find instance " + instance_id)
     
 
 def main():
@@ -252,6 +297,8 @@ def main():
             ec2_access_key = dict(required=False, aliases=['EC2_ACCESS_KEY']),
             region = dict(required=False, aliases=['ec2_region']),
             in_vpc = dict(required=False, choices=BOOLEANS, default=False),
+            interface_id = dict(required=False),
+            private_ip_address = dict(required=False)
         ),
         supports_check_mode=True
     )
@@ -271,28 +318,45 @@ def main():
     public_ip = module.params.get('public_ip')
     state = module.params.get('state')
     in_vpc = module.params.get('in_vpc')
+    interface_id = module.params.get('interface_id')
+    private_ip_address = module.params.get('private_ip_address')
     domain  = "vpc" if in_vpc else None
 
     if state == 'present':
         if public_ip is None:
-            if instance_id is None:
+            if instance_id is None and interface_id is None:
                 address = allocate_address(ec2, domain, module)
                 module.exit_json(changed=True, public_ip=address.public_ip)
             else:
                 # Determine if the instance is inside a VPC or not
-                instance = find_instance(ec2, instance_id, module)
-                if instance.vpc_id != None:
+                if instance_id is None:
                     domain = "vpc"
+                    #Determine if all we need is any EIP associated to a private_ip
+                    if private_ip_address is not None:
+                        a = ec2.get_all_addresses(addresses=None, filters={'private-ip-address':private_ip_address}, allocation_ids=None)
+                        if len(a):
+                            module.exit_json(changed=False, public_ip=a[0].public_ip)
+                else:
+                    instance = find_instance(ec2, instance_id, module)
+                    if instance.vpc_id != None:
+                        domain = "vpc"
                 address = allocate_address(ec2, domain, module)
         else:
             address = find_address(ec2, public_ip, module)
-        associate_ip_and_instance(ec2, address, instance_id, module)
+            
+        if interface_id != None:
+            associate_ip_and_interface(ec2, address, interface_id, private_ip_address, module)
+        else:
+            associate_ip_and_instance(ec2, address, instance_id, module)
     else:
-        if instance_id is None:
+        if instance_id is None and interface_id is None:
             release_address(ec2, public_ip, module)
         else:
             address = find_address(ec2, public_ip, module)
-            disassociate_ip_and_instance(ec2, address, instance_id, module)
+            if interface_id is not None:
+                disassociate_ip_and_instance(ec2, address, instance_id, module)
+            else:
+                disassociate_ip_and_interface(ec2, address, interface_id, module)
 
 
 

@@ -147,6 +147,7 @@ def db_import(module, host, user, password, db_name, target, socket=None):
         cmd = 'bunzip2 < ' + target + ' | ' + cmd
     else:
         cmd += " < %s" % target
+
     rc, stdout, stderr = module.run_command(cmd)
     return rc, stdout, stderr
 
